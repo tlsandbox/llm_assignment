@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/retailnext_outfit_assistant/__init__.py
+src/retailnext_outfit_assistant/catalog.py
+src/retailnext_outfit_assistant/db.py
+src/retailnext_outfit_assistant/openai_utils.py
+src/retailnext_outfit_assistant/retrieval.py
+src/retailnext_outfit_assistant/service.py
+src/retailnext_outfit_assistant.egg-info/PKG-INFO
+src/retailnext_outfit_assistant.egg-info/SOURCES.txt
+src/retailnext_outfit_assistant.egg-info/dependency_links.txt
+src/retailnext_outfit_assistant.egg-info/requires.txt
+src/retailnext_outfit_assistant.egg-info/top_level.txt

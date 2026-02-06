@@ -1,0 +1,125 @@
+Metadata-Version: 2.4
+Name: retailnext-outfit-assistant
+Version: 0.1.0
+Summary: RetailNext multimodal outfit assistant demo (GPT-4o + RAG)
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: openai>=2.0.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: pillow>=10.0.0
+Requires-Dist: fastapi>=0.116.0
+Requires-Dist: uvicorn[standard]>=0.35.0
+Requires-Dist: python-multipart>=0.0.9
+
+# RetailNext Outfit Assistant Demo (Web + API + DB)
+
+RetailNext demo application for executive walkthroughs.
+
+This version delivers a full stack:
+- Frontend: COS/H&M-style storefront UI (desktop + mobile)
+- Backend: FastAPI
+- Persistence: SQLite (`data/retailnext_demo.db`)
+- Retrieval: RAG-style similarity search on `sample_styles_with_embeddings.csv`
+- Multimodal AI: image analysis + recommendation + match scoring using OpenAI models
+
+## What Bob Can Demo
+
+1. **Natural-language-query-search**
+- Bob types a request in the top search bar.
+- App embeds the query and retrieves 10 closest catalog items.
+- App routes to **Your Personalized Item** page.
+
+2. **Image-upload-match**
+- Bob clicks camera icon, uploads a JPG/PNG.
+- App uses GPT-4o vision extraction, generates structured search queries, and retrieves 10 items.
+- App routes to **Your Personalized Item** page.
+
+3. **Check Your Match**
+- Each recommendation has a **Check Your Match** button.
+- App asks the LLM to evaluate match quality for Bob's active session intent.
+- Verdict and rationale are saved to DB and shown inline.
+
+If Bob opens **Your Personalized Item** before searching/uploading, the page shows guidance text to start a flow first.
+
+## Dataset Mapping
+
+Primary 1:1 relationship is preserved:
+- `sample_styles.csv` / `sample_styles_with_embeddings.csv` row `id`
+- `sample_images/<id>.jpg`
+
+The app uses `sample_styles_with_embeddings.csv` for retrieval and links images by `id`.
+
+## Project Structure
+
+```text
+retailnext_outfit_assistant/
+  app/
+    api_server.py                # FastAPI app + routes
+    web/
+      index.html                 # Home storefront
+      personalized.html          # Recommendations page
+      styles.css
+      home.js
+      personalized.js
+  data/
+    sample_clothes/              # Downloaded cookbook data
+    retailnext_demo.db           # SQLite persistence
+  scripts/
+    download_sample_clothes.py   # Pulls sample data from openai-cookbook
+  src/retailnext_outfit_assistant/
+    catalog.py                   # CSV + embedding index loader
+    retrieval.py                 # cosine top-k
+    openai_utils.py              # OpenAI calls
+    db.py                        # SQLite schema + queries
+    service.py                   # Orchestration (search/image/match)
+```
+
+## Quickstart
+
+### 1) Install
+
+```bash
+cd retailnext_outfit_assistant
+python3 -m venv .venv
+./.venv/bin/pip install --upgrade pip
+./.venv/bin/pip install -r requirements.txt
+./.venv/bin/pip install -e .
+```
+
+### 2) Set environment variables
+
+```bash
+cp .env.template .env
+# Edit .env and set OPENAI_API_KEY
+```
+
+### 3) Download sample data
+
+```bash
+./.venv/bin/python scripts/download_sample_clothes.py
+```
+
+### 4) Run backend + frontend
+
+```bash
+set -a; source .env; set +a
+./.venv/bin/uvicorn app.api_server:app --reload --port 8000
+```
+
+Open: <http://127.0.0.1:8000>
+
+## API Endpoints
+
+- `GET /api/health`
+- `GET /api/home-products?limit=24`
+- `POST /api/search`
+- `POST /api/image-match` (multipart form)
+- `GET /api/personalized/{session_id}`
+- `POST /api/check-match`
+- `GET /api/image/{product_id}`
+
+## Notes
+
+- If local `sample_images` are missing, image route falls back to GitHub image URLs.
+- If `OPENAI_API_KEY` is missing, app still runs with placeholder random recommendations so UI demo does not block.
