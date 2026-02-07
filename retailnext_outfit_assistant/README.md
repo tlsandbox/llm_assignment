@@ -9,6 +9,31 @@ This version delivers a full stack:
 - Retrieval: RAG-style similarity search on `sample_styles_with_embeddings.csv`
 - Multimodal AI: image analysis + recommendation + match scoring using OpenAI models
 
+## Documentation
+
+- [Documentation Index](./docs/README.md)
+- [Architecture](./docs/ARCHITECTURE.md)
+- [Check Your Match Scoring](./docs/CHECK_YOUR_MATCH.md)
+- [Troubleshooting Guide](./docs/TROUBLESHOOTING.md)
+
+## High-Level Diagram
+
+```mermaid
+flowchart LR
+    Browser["Browser UI"]
+    API["FastAPI app/api_server.py"]
+    Service["OutfitAssistantService service.py"]
+    DB["SQLite data/retailnext_demo.db"]
+    OpenAI["OpenAI APIs"]
+    Index["CSV Embedding Index"]
+
+    Browser --> API
+    API --> Service
+    Service --> DB
+    Service --> OpenAI
+    Service --> Index
+```
+
 ## What Bob Can Demo
 
 1. **Natural-language-query-search**
