@@ -7,6 +7,7 @@ Use this folder for technical explanations, architecture references, and operati
 - [Architecture](./ARCHITECTURE.md)
 - [Check Your Match Scoring](./CHECK_YOUR_MATCH.md)
 - [Troubleshooting Guide](./TROUBLESHOOTING.md)
+- [Release Notes v1.0.0](./releases/v1.0.0.md)
 
 ## Recommended Reading Order
 
