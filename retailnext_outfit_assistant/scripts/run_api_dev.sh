@@ -21,7 +21,9 @@ REQUESTED_PORT="${PORT:-8001}"
 
 port_is_busy() {
   local port="$1"
-  lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+  # Treat any process-bound TCP state on the port as busy (LISTEN/CLOSED/etc)
+  # to avoid uvicorn bind races with stale orphaned watcher processes.
+  lsof -nP -iTCP:"${port}" >/dev/null 2>&1
 }
 
 find_free_port() {
@@ -43,6 +45,19 @@ if [[ ${#stale_pids[@]} -gt 0 ]]; then
   echo "Stopping stale app server process(es): ${stale_pids[*]}"
   kill "${stale_pids[@]}" 2>/dev/null || true
   sleep 1
+
+  stubborn_pids=()
+  for pid in "${stale_pids[@]}"; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      stubborn_pids+=("${pid}")
+    fi
+  done
+
+  if [[ ${#stubborn_pids[@]} -gt 0 ]]; then
+    echo "Force stopping stubborn process(es): ${stubborn_pids[*]}"
+    kill -9 "${stubborn_pids[@]}" 2>/dev/null || true
+    sleep 1
+  fi
 fi
 
 PORT_TO_USE="${REQUESTED_PORT}"
