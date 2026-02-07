@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -32,6 +33,18 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 SUPPORTED_HOME_GENDERS = {"women": "Women", "men": "Men"}
 
 app = FastAPI(title="RetailNext Outfit Assistant Demo", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:8001",
+        "http://localhost:8000",
+        "http://localhost:8001",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 service = OutfitAssistantService(root_dir=ROOT_DIR)

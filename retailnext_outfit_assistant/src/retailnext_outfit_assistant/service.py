@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
+import logging
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -23,6 +26,8 @@ _GITHUB_IMAGE_PREFIX = (
     "https://raw.githubusercontent.com/openai/openai-cookbook/main/"
     "examples/data/sample_clothes/sample_images"
 )
+_LOGGER = logging.getLogger(__name__)
+_OPENAI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="openai-call")
 
 
 class OutfitAssistantService:
@@ -36,6 +41,11 @@ class OutfitAssistantService:
         self.cfg = OpenAIConfig.from_env()
         self.client = None
         self._embedding_cache: dict[str, np.ndarray] = {}
+        self.search_timeout_seconds = self._env_timeout("RN_AI_SEARCH_TIMEOUT_SECONDS", 25.0)
+        self.image_timeout_seconds = self._env_timeout("RN_AI_IMAGE_TIMEOUT_SECONDS", 50.0)
+        self.match_timeout_seconds = self._env_timeout("RN_AI_MATCH_TIMEOUT_SECONDS", 20.0)
+        self.transcribe_timeout_seconds = self._env_timeout("RN_AI_TRANSCRIBE_TIMEOUT_SECONDS", 25.0)
+        self.request_timeout_seconds = self._env_timeout("RN_AI_REQUEST_TIMEOUT_SECONDS", 20.0)
 
         self.index: CatalogIndex = build_or_load_index(self.data_dir, self.cache_dir)
         self.article_types = unique_article_types(self.index.items)
@@ -54,17 +64,57 @@ class OutfitAssistantService:
             self.client = make_client()
         return self.client
 
-    def _embed(self, query: str) -> np.ndarray:
+    @staticmethod
+    def _env_timeout(name: str, default: float) -> float:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = float(raw)
+        except Exception:
+            return default
+        return value if value > 0 else default
+
+    @staticmethod
+    def _remaining_timeout(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("AI time budget was exceeded.")
+        return remaining
+
+    def _run_with_timeout(self, operation: str, fn, timeout_seconds: float):
+        safe_timeout = max(1.0, float(timeout_seconds))
+        future = _OPENAI_EXECUTOR.submit(fn)
+        try:
+            return future.result(timeout=safe_timeout)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise RuntimeError(f"{operation} timed out after {int(round(safe_timeout))}s.") from exc
+        except Exception as exc:
+            raise RuntimeError(f"{operation} failed: {exc}") from exc
+
+    def _embed(self, query: str, *, timeout_seconds: float | None = None) -> np.ndarray:
         cleaned = query.strip()
         if cleaned in self._embedding_cache:
             return self._embedding_cache[cleaned]
 
         client = self._ensure_client()
-        embedding = np.asarray(text_embedding(client, cleaned, self.cfg.embedding_model), dtype=np.float32)
+        embedding_values = self._run_with_timeout(
+            "Embedding request",
+            lambda: text_embedding(client, cleaned, self.cfg.embedding_model),
+            timeout_seconds if timeout_seconds is not None else self.request_timeout_seconds,
+        )
+        embedding = np.asarray(embedding_values, dtype=np.float32)
         self._embedding_cache[cleaned] = embedding
         return embedding
 
-    def _rank_from_queries(self, queries: list[str], *, top_k: int) -> list[tuple[int, float]]:
+    def _rank_from_queries(
+        self,
+        queries: list[str],
+        *,
+        top_k: int,
+        deadline: float | None = None,
+    ) -> list[tuple[int, float]]:
         query_scores: dict[int, float] = {}
 
         for query in queries[:6]:
@@ -72,7 +122,10 @@ class OutfitAssistantService:
             if not cleaned:
                 continue
 
-            emb = self._embed(cleaned)
+            call_timeout = self.request_timeout_seconds
+            if deadline is not None:
+                call_timeout = min(call_timeout, self._remaining_timeout(deadline))
+            emb = self._embed(cleaned, timeout_seconds=call_timeout)
             idx, scores = top_k_cosine(emb, self.index.embeddings, self.index.norms, k=max(top_k * 8, top_k))
             for row_id, score in zip(idx.tolist(), scores.tolist()):
                 previous = query_scores.get(row_id)
@@ -110,11 +163,15 @@ class OutfitAssistantService:
             raise ValueError("Audio payload is empty.")
 
         client = self._ensure_client()
-        text = transcribe_audio(
-            client=client,
-            audio_bytes=audio_bytes,
-            filename=filename,
-            model=self.cfg.audio_model,
+        text = self._run_with_timeout(
+            "Transcription request",
+            lambda: transcribe_audio(
+                client=client,
+                audio_bytes=audio_bytes,
+                filename=filename,
+                model=self.cfg.audio_model,
+            ),
+            self.transcribe_timeout_seconds,
         )
         if not text:
             raise ValueError("No speech detected. Please try again and speak clearly.")
@@ -130,9 +187,17 @@ class OutfitAssistantService:
         if not cleaned:
             raise ValueError("Please enter a search query.")
 
+        ai_powered = False
         if self.ai_enabled:
-            ranked = self._rank_from_queries([cleaned], top_k=top_k)
-            note = "Outfit Assistant AI powered by OpenAI generated these recommendations from your search."
+            deadline = time.monotonic() + self.search_timeout_seconds
+            try:
+                ranked = self._rank_from_queries([cleaned], top_k=top_k, deadline=deadline)
+                note = "Outfit Assistant AI powered by OpenAI generated these recommendations from your search."
+                ai_powered = True
+            except Exception:
+                _LOGGER.warning("Falling back to random recommendations for text search due to OpenAI unavailability.")
+                ranked = self._random_recommendations(top_k)
+                note = "OpenAI search is unavailable right now. Showing fallback recommendations so you can continue."
         else:
             ranked = self._random_recommendations(top_k)
             note = "OpenAI key missing, so recommendations are random placeholders for UI demo."
@@ -147,7 +212,7 @@ class OutfitAssistantService:
 
         payload = self.get_personalized(session_id)
         payload["assistant_note"] = note
-        payload["ai_powered"] = self.ai_enabled
+        payload["ai_powered"] = ai_powered
         return payload
 
     def search_by_image(
@@ -157,30 +222,51 @@ class OutfitAssistantService:
         shopper_name: str = "Bob",
         top_k: int = 10,
     ) -> dict[str, Any]:
+        ai_powered = False
         if self.ai_enabled:
-            client = self._ensure_client()
-            analysis = analyze_outfit_image(
-                client=client,
-                image_bytes=image_bytes,
-                article_types=self.article_types,
-                model=self.cfg.vision_model,
-            )
-            queries = [q for q in analysis.get("search_queries", []) if isinstance(q, str) and q.strip()]
-            if not queries:
-                fallback_query = " ".join(
-                    [
-                        str(analysis.get("gender", "")),
-                        str(analysis.get("occasion", "")),
-                        " ".join(analysis.get("colors", [])),
-                        " ".join(analysis.get("article_types", [])),
-                    ]
-                ).strip()
-                if fallback_query:
-                    queries = [fallback_query]
+            deadline = time.monotonic() + self.image_timeout_seconds
+            try:
+                client = self._ensure_client()
+                analysis = self._run_with_timeout(
+                    "Vision analysis request",
+                    lambda: analyze_outfit_image(
+                        client=client,
+                        image_bytes=image_bytes,
+                        article_types=self.article_types,
+                        model=self.cfg.vision_model,
+                    ),
+                    min(self.request_timeout_seconds, self._remaining_timeout(deadline)),
+                )
+                queries = [q for q in analysis.get("search_queries", []) if isinstance(q, str) and q.strip()]
+                if not queries:
+                    fallback_query = " ".join(
+                        [
+                            str(analysis.get("gender", "")),
+                            str(analysis.get("occasion", "")),
+                            " ".join(analysis.get("colors", [])),
+                            " ".join(analysis.get("article_types", [])),
+                        ]
+                    ).strip()
+                    if fallback_query:
+                        queries = [fallback_query]
 
-            ranked = self._rank_from_queries(queries, top_k=top_k) if queries else self._random_recommendations(top_k)
-            image_summary = json.dumps(analysis)
-            note = "Outfit Assistant AI powered by OpenAI analyzed your image and found matching items."
+                ranked = (
+                    self._rank_from_queries(queries, top_k=top_k, deadline=deadline)
+                    if queries
+                    else self._random_recommendations(top_k)
+                )
+                image_summary = json.dumps(analysis)
+                note = "Outfit Assistant AI powered by OpenAI analyzed your image and found matching items."
+                ai_powered = True
+            except Exception:
+                _LOGGER.warning("Falling back to random recommendations for image search due to OpenAI unavailability.")
+                analysis = {
+                    "error": "openai_unavailable",
+                    "search_queries": [],
+                }
+                ranked = self._random_recommendations(top_k)
+                image_summary = json.dumps(analysis)
+                note = "Image analysis is unavailable right now. Showing fallback recommendations so you can continue."
         else:
             analysis = {
                 "error": "OPENAI_API_KEY not configured",
@@ -201,7 +287,7 @@ class OutfitAssistantService:
         payload = self.get_personalized(session_id)
         payload["assistant_note"] = note
         payload["image_analysis"] = analysis
-        payload["ai_powered"] = self.ai_enabled
+        payload["ai_powered"] = ai_powered
         return payload
 
     def get_personalized(self, session_id: str) -> dict[str, Any]:
@@ -263,6 +349,7 @@ class OutfitAssistantService:
         if not product:
             raise KeyError("Product not found.")
 
+        ai_powered = False
         if self.ai_enabled:
             client = self._ensure_client()
             prompt = (
@@ -284,19 +371,25 @@ class OutfitAssistantService:
                 f"- year: {product['year']}\n"
             )
 
-            resp = client.responses.create(
-                model=self.cfg.chat_model,
-                input=prompt,
-                temperature=0.2,
-            )
-            raw = (resp.output_text or "").strip()
             try:
+                resp = self._run_with_timeout(
+                    "Match scoring request",
+                    lambda: client.responses.create(
+                        model=self.cfg.chat_model,
+                        input=prompt,
+                        temperature=0.2,
+                    ),
+                    self.match_timeout_seconds,
+                )
+                raw = (resp.output_text or "").strip()
                 parsed = json.loads(raw)
                 verdict = str(parsed.get("verdict", "Possible match"))
                 rationale = str(parsed.get("rationale", "The item has partial alignment with Bob's intent."))
                 confidence = parsed.get("confidence")
                 confidence = float(confidence) if confidence is not None else 0.5
+                ai_powered = True
             except Exception:
+                _LOGGER.warning("Falling back to heuristic match scoring due to OpenAI unavailability.")
                 verdict, rationale, confidence = self._heuristic_match(session, product)
         else:
             verdict, rationale, confidence = self._heuristic_match(session, product)
@@ -315,7 +408,7 @@ class OutfitAssistantService:
             "verdict": verdict,
             "rationale": rationale,
             "confidence": confidence,
-            "ai_powered": self.ai_enabled,
+            "ai_powered": ai_powered,
         }
 
     def image_path_for_product(self, product_id: int) -> Path | None:

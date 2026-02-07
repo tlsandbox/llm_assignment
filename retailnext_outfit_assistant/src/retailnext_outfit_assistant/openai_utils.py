@@ -28,8 +28,32 @@ class OpenAIConfig:
         )
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except Exception:
+        return default
+    return value if value > 0 else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    return value if value >= 0 else default
+
+
 def make_client() -> OpenAI:
-    return OpenAI()
+    timeout_seconds = _env_float("RN_OPENAI_TIMEOUT_SECONDS", 20.0)
+    max_retries = _env_int("RN_OPENAI_MAX_RETRIES", 0)
+    return OpenAI(timeout=timeout_seconds, max_retries=max_retries)
 
 
 def text_embedding(client: OpenAI, text: str, model: str) -> list[float]:

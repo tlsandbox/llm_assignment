@@ -13,6 +13,7 @@ const imageInput = document.getElementById('image-input');
 
 const params = new URLSearchParams(window.location.search);
 let currentSessionId = params.get('session');
+const API_TIMEOUT_MS = 45000;
 let mediaRecorder = null;
 let recorderStream = null;
 let recordingChunks = [];
@@ -21,6 +22,29 @@ let recordingStopTimer = null;
 function setStatus(message, isError = false) {
   statusText.textContent = message;
   statusText.classList.toggle('error', isError);
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (_error) {
+      payload = null;
+    }
+    return { response, payload };
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s. Please try again.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 function setVoiceButtonState(isRecording) {
@@ -74,16 +98,19 @@ async function transcribeAudioBlob(audioBlob) {
   const formData = new FormData();
   formData.append('audio', audioFile);
 
-  const response = await fetch('/api/transcribe', {
-    method: 'POST',
-    body: formData,
-  });
-  const payload = await response.json();
+  const { response, payload } = await fetchJsonWithTimeout(
+    '/api/transcribe',
+    {
+      method: 'POST',
+      body: formData,
+    },
+    30000
+  );
   if (!response.ok) {
-    throw new Error(payload.detail || 'Voice transcription failed.');
+    throw new Error(payload?.detail || 'Voice transcription failed.');
   }
 
-  const text = (payload.text || '').trim();
+  const text = (payload?.text || '').trim();
   if (!text) {
     throw new Error('No speech was detected. Please try again.');
   }
@@ -226,11 +253,14 @@ async function loadPersonalized(sessionId) {
   setStatus('Loading your personalized recommendations...');
 
   try {
-    const response = await fetch(`/api/personalized/${encodeURIComponent(sessionId)}`);
-    const payload = await response.json();
+    const { response, payload } = await fetchJsonWithTimeout(
+      `/api/personalized/${encodeURIComponent(sessionId)}`,
+      {},
+      30000
+    );
 
     if (!response.ok) {
-      throw new Error(payload.detail || 'Could not load personalized recommendations.');
+      throw new Error(payload?.detail || 'Could not load personalized recommendations.');
     }
 
     const recommendations = payload.recommendations || [];
@@ -264,7 +294,7 @@ async function runCheckMatch(productId, button, card) {
   button.textContent = 'Checking...';
 
   try {
-    const response = await fetch('/api/check-match', {
+    const { response, payload } = await fetchJsonWithTimeout('/api/check-match', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -274,10 +304,8 @@ async function runCheckMatch(productId, button, card) {
         product_id: productId,
       }),
     });
-
-    const payload = await response.json();
     if (!response.ok) {
-      throw new Error(payload.detail || 'Match check failed.');
+      throw new Error(payload?.detail || 'Match check failed.');
     }
 
     const existing = card.querySelector('.match-result');
@@ -314,7 +342,7 @@ async function runSearch(event) {
   setStatus('Running natural-language-query-search...');
 
   try {
-    const response = await fetch('/api/search', {
+    const { response, payload } = await fetchJsonWithTimeout('/api/search', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -325,10 +353,8 @@ async function runSearch(event) {
         top_k: 10,
       }),
     });
-
-    const payload = await response.json();
     if (!response.ok) {
-      throw new Error(payload.detail || 'Search failed.');
+      throw new Error(payload?.detail || 'Search failed.');
     }
 
     currentSessionId = payload?.session?.session_id;
@@ -367,14 +393,16 @@ async function runImageMatch(event) {
   setStatus('Running image-upload-match flow...');
 
   try {
-    const response = await fetch('/api/image-match', {
-      method: 'POST',
-      body: formData,
-    });
-
-    const payload = await response.json();
+    const { response, payload } = await fetchJsonWithTimeout(
+      '/api/image-match',
+      {
+        method: 'POST',
+        body: formData,
+      },
+      60000
+    );
     if (!response.ok) {
-      throw new Error(payload.detail || 'Image match failed.');
+      throw new Error(payload?.detail || 'Image match failed.');
     }
 
     currentSessionId = payload?.session?.session_id;

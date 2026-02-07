@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${ROOT_DIR}/.env"
+  set +a
+fi
+
+UVICORN_BIN="${ROOT_DIR}/.venv/bin/uvicorn"
+if [[ ! -x "${UVICORN_BIN}" ]]; then
+  echo "Missing ${UVICORN_BIN}. Create the virtualenv and install dependencies first."
+  exit 1
+fi
+
+REQUESTED_PORT="${PORT:-8000}"
+
+find_free_port() {
+  local port="$1"
+  while lsof -nP -iTCP@127.0.0.1:"${port}" -sTCP:LISTEN >/dev/null 2>&1; do
+    port=$((port + 1))
+  done
+  echo "${port}"
+}
+
+stale_pids=()
+while IFS= read -r pid; do
+  if [[ -n "${pid}" ]]; then
+    stale_pids+=("${pid}")
+  fi
+done < <(ps -Ao pid=,command= | awk '/[.]venv\/bin\/uvicorn app[.]api_server:app/ {print $1}')
+
+if [[ ${#stale_pids[@]} -gt 0 ]]; then
+  echo "Stopping stale app server process(es): ${stale_pids[*]}"
+  kill "${stale_pids[@]}" 2>/dev/null || true
+  sleep 1
+fi
+
+PORT_TO_USE="${REQUESTED_PORT}"
+if lsof -nP -iTCP@127.0.0.1:"${PORT_TO_USE}" -sTCP:LISTEN >/dev/null 2>&1; then
+  PORT_TO_USE="$(find_free_port $((REQUESTED_PORT + 1)))"
+  echo "Port 127.0.0.1:${REQUESTED_PORT} is busy; using ${PORT_TO_USE} instead."
+fi
+
+echo "Starting RetailNext API on http://127.0.0.1:${PORT_TO_USE}"
+exec "${UVICORN_BIN}" app.api_server:app \
+  --app-dir "${ROOT_DIR}" \
+  --host 127.0.0.1 \
+  --port "${PORT_TO_USE}" \
+  --reload \
+  --reload-dir app \
+  --reload-dir src

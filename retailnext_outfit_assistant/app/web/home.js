@@ -15,6 +15,10 @@ const imageInput = document.getElementById('image-input');
 
 const params = new URLSearchParams(window.location.search);
 let currentGenderFilter = normalizeGender(params.get('gender'));
+const HOME_FEED_TIMEOUT_MS = 20000;
+const API_TIMEOUT_MS = 45000;
+const LOCAL_API_ORIGINS = ['http://127.0.0.1:8000', 'http://127.0.0.1:8001', 'http://localhost:8000', 'http://localhost:8001'];
+let apiBase = '';
 
 let mediaRecorder = null;
 let recorderStream = null;
@@ -38,6 +42,97 @@ function normalizeGender(rawValue) {
 function setStatus(message, isError = false) {
   statusText.textContent = message;
   statusText.classList.toggle('error', isError);
+}
+
+function buildApiCandidates(url) {
+  if (!url.startsWith('/api/')) {
+    return [apiBase ? `${apiBase}${url}` : url];
+  }
+
+  const candidates = [];
+  if (apiBase) {
+    candidates.push(`${apiBase}${url}`);
+  } else {
+    candidates.push(url);
+  }
+
+  LOCAL_API_ORIGINS.forEach((origin) => {
+    const skipCurrent = origin === window.location.origin && !apiBase;
+    if (!skipCurrent && origin !== apiBase) {
+      candidates.push(`${origin}${url}`);
+    }
+  });
+
+  const uniqueCandidates = [];
+  const seen = new Set();
+  candidates.forEach((candidate) => {
+    if (!seen.has(candidate)) {
+      seen.add(candidate);
+      uniqueCandidates.push(candidate);
+    }
+  });
+  return uniqueCandidates;
+}
+
+function rememberWorkingApiBase(candidateUrl) {
+  if (!candidateUrl.startsWith('http')) {
+    apiBase = '';
+    return;
+  }
+  const origin = new URL(candidateUrl, window.location.origin).origin;
+  apiBase = origin === window.location.origin ? '' : origin;
+}
+
+function resolveApiUrl(url) {
+  if (!url || typeof url !== 'string') {
+    return url;
+  }
+  if (apiBase && url.startsWith('/api/')) {
+    return `${apiBase}${url}`;
+  }
+  return url;
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
+  const candidates = buildApiCandidates(url);
+  let lastError = null;
+
+  for (const candidate of candidates) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(candidate, { ...options, signal: controller.signal });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (_error) {
+        payload = null;
+      }
+      rememberWorkingApiBase(candidate);
+      return { response, payload };
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s. Please try again.`);
+      }
+      lastError = error;
+      const isNetworkIssue =
+        error instanceof TypeError ||
+        String(error?.message || '')
+          .toLowerCase()
+          .includes('failed to fetch');
+      if (!isNetworkIssue) {
+        throw error;
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  if (apiBase) {
+    throw new Error(`Failed to fetch from current page origin. API is responding on ${apiBase}.`);
+  }
+  throw lastError || new Error('Failed to fetch');
 }
 
 function setVoiceButtonState(isRecording) {
@@ -109,16 +204,19 @@ async function transcribeAudioBlob(audioBlob) {
   const formData = new FormData();
   formData.append('audio', audioFile);
 
-  const response = await fetch('/api/transcribe', {
-    method: 'POST',
-    body: formData,
-  });
-  const payload = await response.json();
+  const { response, payload } = await fetchJsonWithTimeout(
+    '/api/transcribe',
+    {
+      method: 'POST',
+      body: formData,
+    },
+    30000
+  );
   if (!response.ok) {
-    throw new Error(payload.detail || 'Voice transcription failed.');
+    throw new Error(payload?.detail || 'Voice transcription failed.');
   }
 
-  const text = (payload.text || '').trim();
+  const text = (payload?.text || '').trim();
   if (!text) {
     throw new Error('No speech was detected. Please try again.');
   }
@@ -242,13 +340,16 @@ async function loadHomeProducts() {
       requestUrl.searchParams.set('gender', currentGenderFilter);
     }
 
-    const response = await fetch(`${requestUrl.pathname}${requestUrl.search}`);
+    const { response, payload } = await fetchJsonWithTimeout(
+      `${requestUrl.pathname}${requestUrl.search}`,
+      {},
+      HOME_FEED_TIMEOUT_MS
+    );
     if (!response.ok) {
-      throw new Error('Could not load product feed.');
+      throw new Error(payload?.detail || 'Could not load product feed.');
     }
 
-    const payload = await response.json();
-    payload.products.forEach((product) => {
+    (payload?.products || []).forEach((product) => {
       grid.appendChild(productCard(product));
     });
 
@@ -273,7 +374,7 @@ async function runSearch(event) {
   setStatus('Outfit Assistant AI is searching similar items...');
 
   try {
-    const response = await fetch('/api/search', {
+    const { response, payload } = await fetchJsonWithTimeout('/api/search', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -284,10 +385,8 @@ async function runSearch(event) {
         top_k: 10,
       }),
     });
-
-    const payload = await response.json();
     if (!response.ok) {
-      throw new Error(payload.detail || 'Search failed.');
+      throw new Error(payload?.detail || 'Search failed.');
     }
 
     const sessionId = payload?.session?.session_id;
@@ -329,14 +428,16 @@ async function runImageMatch(event) {
   setStatus('Analyzing image and matching catalog items...');
 
   try {
-    const response = await fetch('/api/image-match', {
-      method: 'POST',
-      body: formData,
-    });
-
-    const payload = await response.json();
+    const { response, payload } = await fetchJsonWithTimeout(
+      '/api/image-match',
+      {
+        method: 'POST',
+        body: formData,
+      },
+      60000
+    );
     if (!response.ok) {
-      throw new Error(payload.detail || 'Image matching failed.');
+      throw new Error(payload?.detail || 'Image matching failed.');
     }
 
     const sessionId = payload?.session?.session_id;

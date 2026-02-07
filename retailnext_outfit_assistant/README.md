@@ -89,11 +89,25 @@ cp .env.template .env
 ### 4) Run backend + frontend
 
 ```bash
-set -a; source .env; set +a
-./.venv/bin/uvicorn app.api_server:app --reload --port 8000
+chmod +x scripts/run_api_dev.sh
+./scripts/run_api_dev.sh
 ```
 
-Open: <http://127.0.0.1:8000>
+The script will:
+- Load `.env`
+- Stop stale uvicorn dev processes for this app
+- Start on `PORT` (default `8000`)
+- Auto-pick the next free port if `8000` is already busy (for example, Docker publishing `8000`)
+- Restrict reload watching to `app/` and `src/` for a faster/more-stable dev loop
+
+Open the URL printed in the terminal (usually <http://127.0.0.1:8000>).
+
+If you run uvicorn manually, keep module resolution explicit:
+
+```bash
+set -a; source .env; set +a
+./.venv/bin/uvicorn app.api_server:app --app-dir . --reload --port 8000
+```
 
 ## API Endpoints
 
@@ -109,3 +123,5 @@ Open: <http://127.0.0.1:8000>
 
 - If local `sample_images` are missing, image route falls back to GitHub image URLs.
 - If `OPENAI_API_KEY` is missing, app still runs with placeholder random recommendations so UI demo does not block.
+- AI endpoints now enforce server-side time budgets (`RN_AI_*_TIMEOUT_SECONDS`) so the UI does not hang on long upstream OpenAI calls.
+- If OpenAI is slow/unavailable, search/image/match flows degrade gracefully with fallback recommendations or heuristic scoring.
