@@ -96,17 +96,17 @@ chmod +x scripts/run_api_dev.sh
 The script will:
 - Load `.env`
 - Stop stale uvicorn dev processes for this app
-- Start on `PORT` (default `8000`)
-- Auto-pick the next free port if `8000` is already busy (for example, Docker publishing `8000`)
+- Start on `PORT` (default `8001`)
+- Auto-pick the next free port if that port is already busy
 - Restrict reload watching to `app/` and `src/` for a faster/more-stable dev loop
 
-Open the URL printed in the terminal (usually <http://127.0.0.1:8000>).
+Open the URL printed in the terminal (usually <http://127.0.0.1:8001>).
 
 If you run uvicorn manually, keep module resolution explicit:
 
 ```bash
 set -a; source .env; set +a
-./.venv/bin/uvicorn app.api_server:app --app-dir . --reload --port 8000
+./.venv/bin/uvicorn app.api_server:app --app-dir . --reload --host 127.0.0.1 --port 8001
 ```
 
 ## API Endpoints

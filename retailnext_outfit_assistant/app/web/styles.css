@@ -353,6 +353,42 @@ body {
   color: var(--ink);
 }
 
+.match-judgement {
+  margin-top: 6px;
+}
+
+.match-breakdown {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.match-breakdown li + li {
+  margin-top: 3px;
+}
+
+.match-breakdown strong {
+  color: var(--ink);
+}
+
+.match-modal {
+  width: min(760px, calc(100vw - 24px));
+}
+
+.match-modal-body {
+  max-height: min(78vh, 720px);
+  overflow: auto;
+}
+
+.match-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .site-footer {
   display: grid;
   grid-template-columns: repeat(4, minmax(120px, 1fr));

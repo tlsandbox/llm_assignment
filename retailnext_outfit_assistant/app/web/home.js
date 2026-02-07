@@ -17,8 +17,6 @@ const params = new URLSearchParams(window.location.search);
 let currentGenderFilter = normalizeGender(params.get('gender'));
 const HOME_FEED_TIMEOUT_MS = 20000;
 const API_TIMEOUT_MS = 45000;
-const LOCAL_API_ORIGINS = ['http://127.0.0.1:8000', 'http://127.0.0.1:8001', 'http://localhost:8000', 'http://localhost:8001'];
-let apiBase = '';
 
 let mediaRecorder = null;
 let recorderStream = null;
@@ -44,95 +42,27 @@ function setStatus(message, isError = false) {
   statusText.classList.toggle('error', isError);
 }
 
-function buildApiCandidates(url) {
-  if (!url.startsWith('/api/')) {
-    return [apiBase ? `${apiBase}${url}` : url];
-  }
-
-  const candidates = [];
-  if (apiBase) {
-    candidates.push(`${apiBase}${url}`);
-  } else {
-    candidates.push(url);
-  }
-
-  LOCAL_API_ORIGINS.forEach((origin) => {
-    const skipCurrent = origin === window.location.origin && !apiBase;
-    if (!skipCurrent && origin !== apiBase) {
-      candidates.push(`${origin}${url}`);
-    }
-  });
-
-  const uniqueCandidates = [];
-  const seen = new Set();
-  candidates.forEach((candidate) => {
-    if (!seen.has(candidate)) {
-      seen.add(candidate);
-      uniqueCandidates.push(candidate);
-    }
-  });
-  return uniqueCandidates;
-}
-
-function rememberWorkingApiBase(candidateUrl) {
-  if (!candidateUrl.startsWith('http')) {
-    apiBase = '';
-    return;
-  }
-  const origin = new URL(candidateUrl, window.location.origin).origin;
-  apiBase = origin === window.location.origin ? '' : origin;
-}
-
-function resolveApiUrl(url) {
-  if (!url || typeof url !== 'string') {
-    return url;
-  }
-  if (apiBase && url.startsWith('/api/')) {
-    return `${apiBase}${url}`;
-  }
-  return url;
-}
-
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
-  const candidates = buildApiCandidates(url);
-  let lastError = null;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  for (const candidate of candidates) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    let payload = null;
     try {
-      const response = await fetch(candidate, { ...options, signal: controller.signal });
-      let payload = null;
-      try {
-        payload = await response.json();
-      } catch (_error) {
-        payload = null;
-      }
-      rememberWorkingApiBase(candidate);
-      return { response, payload };
-    } catch (error) {
-      if (error && error.name === 'AbortError') {
-        throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s. Please try again.`);
-      }
-      lastError = error;
-      const isNetworkIssue =
-        error instanceof TypeError ||
-        String(error?.message || '')
-          .toLowerCase()
-          .includes('failed to fetch');
-      if (!isNetworkIssue) {
-        throw error;
-      }
-    } finally {
-      clearTimeout(timeoutId);
+      payload = await response.json();
+    } catch (_error) {
+      payload = null;
     }
+    return { response, payload };
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s. Please try again.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  if (apiBase) {
-    throw new Error(`Failed to fetch from current page origin. API is responding on ${apiBase}.`);
-  }
-  throw lastError || new Error('Failed to fetch');
 }
 
 function setVoiceButtonState(isRecording) {

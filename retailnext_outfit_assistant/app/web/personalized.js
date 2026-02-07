@@ -10,6 +10,10 @@ const cameraButton = document.getElementById('camera-button');
 const closeModalButton = document.getElementById('close-modal');
 const uploadForm = document.getElementById('upload-form');
 const imageInput = document.getElementById('image-input');
+const matchModal = document.getElementById('match-modal');
+const matchModalTitle = document.getElementById('match-modal-title');
+const matchModalContent = document.getElementById('match-modal-content');
+const closeMatchModalButton = document.getElementById('close-match-modal');
 
 const params = new URLSearchParams(window.location.search);
 let currentSessionId = params.get('session');
@@ -201,6 +205,127 @@ function toggleVoiceCapture() {
   startVoiceCapture();
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function formatValueList(values) {
+  if (!Array.isArray(values) || !values.length) {
+    return '';
+  }
+  return values.map((value) => escapeHtml(value)).join(', ');
+}
+
+function renderJudgementDetails(details) {
+  if (!details || !Array.isArray(details.details)) {
+    return '';
+  }
+
+  const rows = details.details.filter((row) => row && row.status && row.status !== 'Not specified');
+  if (!rows.length) {
+    return '';
+  }
+
+  const listItems = rows
+    .map((row) => {
+      const attribute = escapeHtml(row.attribute || 'Signal');
+      const status = escapeHtml(row.status || 'Missing');
+      const expected = escapeHtml(row.expected || 'Not specified');
+      const actual = escapeHtml(row.actual || 'Unknown');
+      const reason = escapeHtml(row.reason || '');
+      const matchedValues = formatValueList(row.matched_values);
+      const missingValues = formatValueList(row.missing_values);
+      const score = typeof row.score === 'number' ? Math.round(row.score * 100) : null;
+      const scoreText = score === null ? '' : `<br />Signal score: ${score}%`;
+      const matchedText = matchedValues ? `<br />Matched cues: ${matchedValues}` : '';
+      const missingText = missingValues ? `<br />Missing cues: ${missingValues}` : '';
+      const reasonText = reason ? `<br />Judgement: ${reason}` : '';
+      return `
+        <li>
+          <strong>${attribute} (${status})</strong>: expected ${expected}; got ${actual}
+          ${scoreText}${matchedText}${missingText}${reasonText}
+        </li>
+      `;
+    })
+    .join('');
+
+  const ratio = `${details.matched_count || 0}/${details.active_count || rows.length}`;
+  return `
+    <div class="match-judgement">
+      <p class="product-desc"><strong>Signal alignment:</strong> ${ratio}</p>
+      <ul class="match-breakdown">${listItems}</ul>
+    </div>
+  `;
+}
+
+function renderMatchModalBody(productName, payload) {
+  const verdict = escapeHtml(payload?.verdict || 'Possible match');
+  const confidenceValue = typeof payload?.confidence === 'number' ? Math.round(payload.confidence * 100) : null;
+  const confidence = confidenceValue === null ? '' : ` (${confidenceValue}%)`;
+  const rationale = escapeHtml(payload?.rationale || 'No explanation available.');
+  const details = payload?.judgement_details;
+
+  let detailMarkup = '<p class="product-desc">No detailed signal breakdown available.</p>';
+  if (details && Array.isArray(details.details)) {
+    const rows = details.details.filter((row) => row && row.status && row.status !== 'Not specified');
+    if (rows.length) {
+      const listItems = rows
+        .map((row) => {
+          const attribute = escapeHtml(row.attribute || 'Signal');
+          const status = escapeHtml(row.status || 'Missing');
+          const expected = escapeHtml(row.expected || 'Not specified');
+          const actual = escapeHtml(row.actual || 'Unknown');
+          const note = escapeHtml(row.note || '');
+          const reason = escapeHtml(row.reason || '');
+          const matchedValues = formatValueList(row.matched_values);
+          const missingValues = formatValueList(row.missing_values);
+          const score = typeof row.score === 'number' ? Math.round(row.score * 100) : null;
+          return `
+            <li>
+              <strong>${attribute} (${status})</strong><br />
+              Expected: ${expected}<br />
+              Product: ${actual}
+              ${score === null ? '' : `<br />Signal score: ${score}%`}
+              ${matchedValues ? `<br />Matched cues: ${matchedValues}` : ''}
+              ${missingValues ? `<br />Missing cues: ${missingValues}` : ''}
+              ${reason ? `<br />Judgement: ${reason}` : ''}
+              ${note ? `<br />Why it matters: ${note}` : ''}
+            </li>
+          `;
+        })
+        .join('');
+
+      const ratio = `${details.matched_count || 0}/${details.active_count || rows.length}`;
+      detailMarkup = `
+        <p class="product-desc"><strong>Signal alignment:</strong> ${ratio}</p>
+        <ul class="match-breakdown">${listItems}</ul>
+      `;
+    }
+  }
+
+  return `
+    <p class="product-desc"><strong>Selected product:</strong> ${escapeHtml(productName)}</p>
+    <p class="product-desc"><strong>Result:</strong> ${verdict}${confidence}</p>
+    <p class="product-desc">${rationale}</p>
+    ${detailMarkup}
+  `;
+}
+
+function openMatchModal(productName, payload) {
+  if (!matchModal || !matchModalTitle || !matchModalContent) {
+    return;
+  }
+
+  matchModalTitle.textContent = `Check Your Match: ${productName}`;
+  matchModalContent.innerHTML = renderMatchModalBody(productName, payload);
+  matchModal.showModal();
+}
+
 function matchBlock(match) {
   if (!match) {
     return '';
@@ -236,7 +361,7 @@ function productCard(product) {
   `;
 
   const button = article.querySelector('.match-button');
-  button?.addEventListener('click', () => runCheckMatch(product.id, button, article));
+  button?.addEventListener('click', () => runCheckMatch(product, button, article));
 
   return article;
 }
@@ -283,7 +408,7 @@ async function loadPersonalized(sessionId) {
   }
 }
 
-async function runCheckMatch(productId, button, card) {
+async function runCheckMatch(product, button, card) {
   if (!currentSessionId) {
     setStatus('No session available. Run a search or upload first.', true);
     return;
@@ -301,7 +426,7 @@ async function runCheckMatch(productId, button, card) {
       },
       body: JSON.stringify({
         session_id: currentSessionId,
-        product_id: productId,
+        product_id: product.id,
       }),
     });
     if (!response.ok) {
@@ -314,14 +439,17 @@ async function runCheckMatch(productId, button, card) {
     }
 
     const confidence = typeof payload.confidence === 'number' ? ` (${Math.round(payload.confidence * 100)}%)` : '';
+    const breakdownMarkup = renderJudgementDetails(payload?.judgement_details);
     const div = document.createElement('div');
     div.className = 'match-result';
     div.innerHTML = `
-      <strong>${payload.verdict}${confidence}</strong>
-      <p class="product-desc">${payload.rationale}</p>
+      <strong>${escapeHtml(payload.verdict)}${confidence}</strong>
+      <p class="product-desc">${escapeHtml(payload.rationale)}</p>
+      ${breakdownMarkup}
     `;
 
     card.querySelector('.product-copy')?.appendChild(div);
+    openMatchModal(product.name, payload);
     setStatus('Match check completed for selected item.');
   } catch (error) {
     setStatus(error.message, true);
@@ -422,6 +550,7 @@ cameraButton?.addEventListener('click', openUploadModal);
 closeModalButton?.addEventListener('click', closeUploadModal);
 uploadForm?.addEventListener('submit', runImageMatch);
 voiceButton?.addEventListener('click', toggleVoiceCapture);
+closeMatchModalButton?.addEventListener('click', () => matchModal?.close());
 
 if (uploadModal) {
   uploadModal.addEventListener('click', (event) => {
@@ -434,6 +563,21 @@ if (uploadModal) {
 
     if (!withinDialog) {
       closeUploadModal();
+    }
+  });
+}
+
+if (matchModal) {
+  matchModal.addEventListener('click', (event) => {
+    const rect = matchModal.getBoundingClientRect();
+    const withinDialog =
+      event.clientX >= rect.left &&
+      event.clientX <= rect.right &&
+      event.clientY >= rect.top &&
+      event.clientY <= rect.bottom;
+
+    if (!withinDialog) {
+      matchModal.close();
     }
   });
 }

@@ -28,6 +28,51 @@ _GITHUB_IMAGE_PREFIX = (
 )
 _LOGGER = logging.getLogger(__name__)
 _OPENAI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="openai-call")
+_GENERIC_KEYWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "from",
+    "i",
+    "in",
+    "is",
+    "item",
+    "look",
+    "my",
+    "need",
+    "of",
+    "on",
+    "outfit",
+    "please",
+    "search",
+    "shirt",
+    "shirts",
+    "show",
+    "style",
+    "t",
+    "tee",
+    "tshirt",
+    "tshirts",
+    "the",
+    "this",
+    "to",
+    "want",
+    "wants",
+    "wife",
+    "wives",
+    "husband",
+    "woman",
+    "women",
+    "man",
+    "men",
+    "girl",
+    "girls",
+    "boy",
+    "boys",
+    "her",
+    "him",
+}
 
 
 class OutfitAssistantService:
@@ -92,6 +137,515 @@ class OutfitAssistantService:
             raise RuntimeError(f"{operation} timed out after {int(round(safe_timeout))}s.") from exc
         except Exception as exc:
             raise RuntimeError(f"{operation} failed: {exc}") from exc
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        chars = [ch if ch.isalnum() or ch.isspace() else " " for ch in text]
+        return " ".join("".join(chars).split())
+
+    @staticmethod
+    def _tokenize(value: Any) -> list[str]:
+        return [token for token in OutfitAssistantService._normalize_text(value).split() if token]
+
+    @staticmethod
+    def _compact(value: Any) -> str:
+        return "".join(ch for ch in OutfitAssistantService._normalize_text(value) if ch.isalnum())
+
+    @staticmethod
+    def _dedupe(values: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            cleaned = str(value or "").strip()
+            if not cleaned:
+                continue
+            key = cleaned.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(cleaned)
+        return out
+
+    @staticmethod
+    def _score_status(score: float) -> str:
+        if score >= 0.99:
+            return "match"
+        if score >= 0.49:
+            return "partial"
+        return "miss"
+
+    @staticmethod
+    def _status_label(status: str) -> str:
+        mapping = {"match": "Match", "partial": "Partial", "miss": "Missing"}
+        return mapping.get(status, "Missing")
+
+    def _extract_intent(self, session: dict[str, Any]) -> dict[str, Any]:
+        query_text = str(session.get("query_text") or "").strip()
+        query_tokens = self._tokenize(query_text)
+
+        gender = ""
+        women_tokens = {"woman", "women", "wife", "female", "ladies", "lady", "girl", "girls", "her"}
+        men_tokens = {"man", "men", "husband", "male", "gentleman", "gentlemen", "boy", "boys", "him"}
+        if any(token in women_tokens for token in query_tokens):
+            gender = "Women"
+        elif any(token in men_tokens for token in query_tokens):
+            gender = "Men"
+
+        article_hints: list[str] = []
+        query_norm = self._normalize_text(query_text)
+        query_compact_tokens = {self._compact(token) for token in query_tokens}
+        for article in self.article_types:
+            article_norm = self._normalize_text(article)
+            article_compact = self._compact(article)
+            if not article_norm:
+                continue
+            if f" {article_norm} " in f" {query_norm} ":
+                article_hints.append(article)
+                continue
+            if article_compact in query_compact_tokens:
+                article_hints.append(article)
+                continue
+            singular = article_compact[:-1] if article_compact.endswith("s") else article_compact
+            if singular and singular in query_compact_tokens:
+                article_hints.append(article)
+
+        image_summary: dict[str, Any] = {}
+        raw_image_summary = session.get("image_summary")
+        if raw_image_summary:
+            try:
+                parsed = json.loads(str(raw_image_summary))
+                if isinstance(parsed, dict):
+                    image_summary = parsed
+            except Exception:
+                image_summary = {}
+
+        image_gender = str(image_summary.get("gender") or "").strip()
+        if self._normalize_text(image_gender) in {"unknown", ""}:
+            image_gender = ""
+
+        image_colors = image_summary.get("colors", [])
+        image_article_types = image_summary.get("article_types", [])
+        occasion = str(image_summary.get("occasion") or "").strip()
+        if self._normalize_text(occasion) in {"unknown", ""}:
+            occasion = ""
+
+        if image_gender:
+            gender = image_gender
+
+        if isinstance(image_article_types, list):
+            article_hints.extend([str(value).strip() for value in image_article_types if str(value).strip()])
+        article_hints = self._dedupe(article_hints)
+
+        color_hints: list[str] = []
+        if isinstance(image_colors, list):
+            color_hints.extend([str(value).strip() for value in image_colors if str(value).strip()])
+        if not color_hints:
+            # Query color hint extraction from known catalog colors.
+            catalog_colors = {item.base_colour for item in self.index.items if item.base_colour}
+            for color in sorted(catalog_colors):
+                if f" {self._normalize_text(color)} " in f" {query_norm} ":
+                    color_hints.append(color)
+        color_hints = self._dedupe(color_hints)
+
+        usage_hints: list[str] = []
+        if occasion:
+            usage_hints.append(occasion)
+        usage_hints = self._dedupe(usage_hints)
+
+        motif_keywords = [
+            token
+            for token in query_tokens
+            if len(token) >= 4 and token not in _GENERIC_KEYWORDS and token not in {"women", "woman", "men", "man"}
+        ]
+
+        return {
+            "query_text": query_text,
+            "gender": gender,
+            "article_hints": article_hints,
+            "color_hints": color_hints,
+            "usage_hints": usage_hints,
+            "motif_keywords": self._dedupe(motif_keywords),
+        }
+
+    def _signal_gender(self, intent: dict[str, Any], product: dict[str, Any]) -> dict[str, Any]:
+        expected = str(intent.get("gender") or "").strip()
+        actual = str(product.get("gender") or "").strip()
+        if not expected:
+            return {
+                "attribute": "Gender",
+                "expected": "Not specified",
+                "actual": actual or "Unknown",
+                "status": "not_specified",
+                "score": None,
+                "weight": 0.0,
+                "note": "No gender intent was detected from your input.",
+                "reason": "No gender signal in the query/image intent.",
+                "matched_values": [],
+                "missing_values": [],
+            }
+        status = "match" if self._normalize_text(expected) == self._normalize_text(actual) else "miss"
+        score = 1.0 if status == "match" else 0.0
+        if status == "match":
+            reason = f"Gender matched exactly ({expected} vs {actual or 'Unknown'})."
+            matched_values = [expected]
+            missing_values: list[str] = []
+        else:
+            reason = (
+                f"Gender mismatch: expected {expected}, but product gender is {actual or 'Unknown'}."
+            )
+            matched_values = []
+            missing_values = [expected]
+        return {
+            "attribute": "Gender",
+            "expected": expected,
+            "actual": actual or "Unknown",
+            "status": status,
+            "score": score,
+            "weight": 0.22,
+            "note": "Gender alignment is a strong filtering signal.",
+            "reason": reason,
+            "matched_values": matched_values,
+            "missing_values": missing_values,
+        }
+
+    def _signal_article_type(self, intent: dict[str, Any], product: dict[str, Any]) -> dict[str, Any]:
+        raw_hints = [str(value).strip() for value in intent.get("article_hints", []) if str(value).strip()]
+        hints = [(raw_hint, self._normalize_text(raw_hint)) for raw_hint in raw_hints]
+        actual = str(product.get("article_type") or "").strip()
+        actual_norm = self._normalize_text(actual)
+        if not hints:
+            return {
+                "attribute": "Article Type",
+                "expected": "Not specified",
+                "actual": actual or "Unknown",
+                "status": "not_specified",
+                "score": None,
+                "weight": 0.0,
+                "note": "No explicit article type was detected from your input.",
+                "reason": "No article type signal in the query/image intent.",
+                "matched_values": [],
+                "missing_values": [],
+            }
+
+        exact_matches: list[str] = []
+        partial_matches: list[str] = []
+        missing_hints: list[str] = []
+        for raw_hint, hint_norm in hints:
+            if not hint_norm:
+                continue
+            if hint_norm == actual_norm:
+                exact_matches.append(raw_hint)
+                continue
+            if hint_norm in actual_norm or actual_norm in hint_norm:
+                partial_matches.append(raw_hint)
+                continue
+            missing_hints.append(raw_hint)
+
+        if exact_matches:
+            score = 1.0
+            status = "match"
+            related = f" Related intent keyword(s): {', '.join(partial_matches)}." if partial_matches else ""
+            reason = (
+                f"Exact article type match: requested {', '.join(exact_matches)} and product type is "
+                f"{actual or 'Unknown'}.{related}"
+            )
+        elif partial_matches:
+            score = 0.6
+            status = "partial"
+            missing_note = (
+                f" Missing requested type(s): {', '.join(missing_hints)}."
+                if missing_hints
+                else ""
+            )
+            reason = (
+                f"Partial article type match: requested {', '.join(partial_matches)} is related to "
+                f"product type {actual or 'Unknown'}.{missing_note}"
+            )
+        else:
+            score = 0.0
+            status = "miss"
+            reason = (
+                f"Article type missing: requested {', '.join(raw_hints)}, but product type is {actual or 'Unknown'}."
+            )
+
+        matched_values = exact_matches + partial_matches
+        if not missing_hints and status == "miss":
+            missing_hints = raw_hints
+
+        return {
+            "attribute": "Article Type",
+            "expected": ", ".join(raw_hints),
+            "actual": actual or "Unknown",
+            "status": status,
+            "score": score,
+            "weight": 0.28,
+            "note": "Article type fit is the strongest product-structure signal.",
+            "reason": reason,
+            "matched_values": self._dedupe(matched_values),
+            "missing_values": self._dedupe(missing_hints),
+        }
+
+    def _signal_color(self, intent: dict[str, Any], product: dict[str, Any]) -> dict[str, Any]:
+        raw_hints = [str(value).strip() for value in intent.get("color_hints", []) if str(value).strip()]
+        hints = [(raw_hint, self._normalize_text(raw_hint)) for raw_hint in raw_hints]
+        actual = str(product.get("base_colour") or "").strip()
+        actual_norm = self._normalize_text(actual)
+        if not hints:
+            return {
+                "attribute": "Color",
+                "expected": "Not specified",
+                "actual": actual or "Unknown",
+                "status": "not_specified",
+                "score": None,
+                "weight": 0.0,
+                "note": "No explicit color preference was detected.",
+                "reason": "No color signal in the query/image intent.",
+                "matched_values": [],
+                "missing_values": [],
+            }
+
+        exact_matches: list[str] = []
+        partial_matches: list[str] = []
+        missing_hints: list[str] = []
+        for raw_hint, hint_norm in hints:
+            if hint_norm == actual_norm:
+                exact_matches.append(raw_hint)
+                continue
+            if hint_norm and (hint_norm in actual_norm or actual_norm in hint_norm):
+                partial_matches.append(raw_hint)
+                continue
+            missing_hints.append(raw_hint)
+
+        if exact_matches:
+            score = 1.0
+            status = "match"
+            reason = f"Color matched exactly ({', '.join(exact_matches)})."
+        elif partial_matches:
+            score = 0.6
+            status = "partial"
+            reason = (
+                f"Color partially matched via related tone(s): {', '.join(partial_matches)} vs "
+                f"product color {actual or 'Unknown'}."
+            )
+        else:
+            score = 0.0
+            status = "miss"
+            reason = f"Color missing: requested {', '.join(raw_hints)}, product color is {actual or 'Unknown'}."
+
+        return {
+            "attribute": "Color",
+            "expected": ", ".join(raw_hints),
+            "actual": actual or "Unknown",
+            "status": status,
+            "score": score,
+            "weight": 0.15,
+            "note": "Color contributes to style similarity when provided.",
+            "reason": reason,
+            "matched_values": self._dedupe(exact_matches + partial_matches),
+            "missing_values": self._dedupe(missing_hints),
+        }
+
+    def _signal_usage(self, intent: dict[str, Any], product: dict[str, Any]) -> dict[str, Any]:
+        raw_hints = [str(value).strip() for value in intent.get("usage_hints", []) if str(value).strip()]
+        hints = [(raw_hint, self._normalize_text(raw_hint)) for raw_hint in raw_hints]
+        actual = str(product.get("usage") or "").strip()
+        actual_norm = self._normalize_text(actual)
+        if not hints:
+            return {
+                "attribute": "Occasion / Usage",
+                "expected": "Not specified",
+                "actual": actual or "Unknown",
+                "status": "not_specified",
+                "score": None,
+                "weight": 0.0,
+                "note": "No occasion/usage intent was detected.",
+                "reason": "No occasion/usage signal in the query/image intent.",
+                "matched_values": [],
+                "missing_values": [],
+            }
+
+        exact_matches: list[str] = []
+        partial_matches: list[str] = []
+        missing_hints: list[str] = []
+        for raw_hint, hint_norm in hints:
+            if hint_norm == actual_norm:
+                exact_matches.append(raw_hint)
+                continue
+            if hint_norm and (hint_norm in actual_norm or actual_norm in hint_norm):
+                partial_matches.append(raw_hint)
+                continue
+            missing_hints.append(raw_hint)
+
+        if exact_matches:
+            score = 1.0
+            status = "match"
+            reason = f"Usage/occasion matched exactly ({', '.join(exact_matches)})."
+        elif partial_matches:
+            score = 0.5
+            status = "partial"
+            reason = (
+                f"Usage partially matched via related term(s): {', '.join(partial_matches)} vs "
+                f"product usage {actual or 'Unknown'}."
+            )
+        else:
+            score = 0.0
+            status = "miss"
+            reason = f"Usage missing: requested {', '.join(raw_hints)}, product usage is {actual or 'Unknown'}."
+
+        return {
+            "attribute": "Occasion / Usage",
+            "expected": ", ".join(raw_hints),
+            "actual": actual or "Unknown",
+            "status": status,
+            "score": score,
+            "weight": 0.1,
+            "note": "Usage helps refine whether the item fits the occasion.",
+            "reason": reason,
+            "matched_values": self._dedupe(exact_matches + partial_matches),
+            "missing_values": self._dedupe(missing_hints),
+        }
+
+    def _signal_motif(self, intent: dict[str, Any], product: dict[str, Any]) -> dict[str, Any]:
+        raw_keywords = [str(value).strip() for value in intent.get("motif_keywords", []) if str(value).strip()]
+        keywords = [self._normalize_text(value) for value in raw_keywords]
+        product_blob = " ".join(
+            [
+                str(product.get("name") or ""),
+                str(product.get("article_type") or ""),
+                str(product.get("base_colour") or ""),
+                str(product.get("usage") or ""),
+            ]
+        )
+        product_norm = self._normalize_text(product_blob)
+        if not keywords:
+            return {
+                "attribute": "Style Keyword",
+                "expected": "Not specified",
+                "actual": str(product.get("name") or ""),
+                "status": "not_specified",
+                "score": None,
+                "weight": 0.0,
+                "note": "No unique style keyword (motif/theme) was detected.",
+                "reason": "No specific style keyword (motif/theme) was provided.",
+                "matched_values": [],
+                "missing_values": [],
+                "matched_keywords": [],
+                "unmatched_keywords": [],
+            }
+
+        matched = [keyword for keyword in keywords if keyword and keyword in product_norm]
+        unmatched = [keyword for keyword in keywords if keyword not in matched]
+        ratio = len(matched) / max(1, len(keywords))
+        status = "match" if ratio >= 0.99 else ("partial" if ratio >= 0.25 else "miss")
+        normalized_to_raw = {self._normalize_text(value): value for value in raw_keywords}
+        matched_raw = [normalized_to_raw.get(keyword, keyword) for keyword in matched]
+        unmatched_raw = [normalized_to_raw.get(keyword, keyword) for keyword in unmatched]
+
+        if status == "match":
+            reason = f"All style keyword(s) matched in product metadata: {', '.join(matched_raw)}."
+        elif status == "partial":
+            reason = (
+                f"Partial style keyword match: matched {', '.join(matched_raw)}; "
+                f"missing {', '.join(unmatched_raw)}."
+            )
+        else:
+            reason = f"Style keyword missing: none of these were found in product metadata: {', '.join(unmatched_raw)}."
+
+        return {
+            "attribute": "Style Keyword",
+            "expected": ", ".join(raw_keywords),
+            "actual": ", ".join(matched_raw) if matched_raw else "No direct keyword match",
+            "status": status,
+            "score": ratio,
+            "weight": 0.25,
+            "note": "Keywords capture motif/theme intent such as 'sakura'.",
+            "reason": reason,
+            "matched_values": matched_raw,
+            "missing_values": unmatched_raw,
+            "matched_keywords": matched_raw,
+            "unmatched_keywords": unmatched_raw,
+        }
+
+    def _heuristic_breakdown(self, session: dict[str, Any], product: dict[str, Any]) -> dict[str, Any]:
+        intent = self._extract_intent(session)
+        checks = [
+            self._signal_gender(intent, product),
+            self._signal_article_type(intent, product),
+            self._signal_color(intent, product),
+            self._signal_usage(intent, product),
+            self._signal_motif(intent, product),
+        ]
+
+        active_checks = [check for check in checks if check.get("score") is not None and check.get("weight", 0) > 0]
+        total_weight = sum(float(check["weight"]) for check in active_checks)
+        weighted_score = (
+            sum(float(check["score"]) * float(check["weight"]) for check in active_checks) / total_weight
+            if total_weight > 0
+            else 0.0
+        )
+
+        confidence = round(0.2 + 0.7 * weighted_score, 2)
+        confidence = max(0.2, min(0.9, confidence))
+
+        if weighted_score >= 0.78:
+            verdict = "Strong match"
+        elif weighted_score >= 0.62:
+            verdict = "Good match"
+        elif weighted_score >= 0.45:
+            verdict = "Possible match"
+        else:
+            verdict = "Weak match"
+
+        matched = [check for check in active_checks if check["status"] == "match"]
+        partial = [check for check in active_checks if check["status"] == "partial"]
+        missed = [check for check in active_checks if check["status"] == "miss"]
+
+        matched_labels = ", ".join(check["attribute"] for check in matched) or "none"
+        partial_labels = ", ".join(check["attribute"] for check in partial) or "none"
+        missed_labels = ", ".join(check["attribute"] for check in missed) or "none"
+
+        explanation = (
+            f"Score explanation: {int(round(confidence * 100))}% because matched signals = {matched_labels}; "
+            f"partial signals = {partial_labels}; missing signals = {missed_labels}."
+        )
+        signal_detail_parts: list[str] = []
+        for check in active_checks:
+            reason = str(check.get("reason") or "").strip()
+            if reason:
+                signal_detail_parts.append(f"{check.get('attribute')}: {reason}")
+        if signal_detail_parts:
+            explanation += " Details: " + " ".join(signal_detail_parts)
+
+        details: list[dict[str, Any]] = []
+        for check in checks:
+            status = check.get("status")
+            label = "Not specified" if status == "not_specified" else self._status_label(str(status))
+            details.append(
+                {
+                    "attribute": check.get("attribute"),
+                    "expected": check.get("expected"),
+                    "actual": check.get("actual"),
+                    "status": label,
+                    "score": None if check.get("score") is None else round(float(check["score"]), 2),
+                    "weight": round(float(check.get("weight", 0.0)), 2),
+                    "note": check.get("note"),
+                    "reason": check.get("reason"),
+                    "matched_values": check.get("matched_values", []),
+                    "missing_values": check.get("missing_values", []),
+                }
+            )
+
+        return {
+            "verdict": verdict,
+            "confidence": confidence,
+            "rationale": explanation,
+            "intent": intent,
+            "details": details,
+            "matched_count": len(matched),
+            "active_count": len(active_checks),
+            "weighted_score": round(weighted_score, 3),
+        }
 
     def _embed(self, query: str, *, timeout_seconds: float | None = None) -> np.ndarray:
         cleaned = query.strip()
@@ -315,30 +869,12 @@ class OutfitAssistantService:
         }
 
     def _heuristic_match(self, session: dict[str, Any], product: dict[str, Any]) -> tuple[str, str, float]:
-        intent = " ".join(
-            [
-                str(session.get("query_text") or ""),
-                str(session.get("image_summary") or ""),
-            ]
-        ).lower()
-        score = 0
-        signals = [
-            str(product.get("article_type", "")).lower(),
-            str(product.get("base_colour", "")).lower(),
-            str(product.get("usage", "")).lower(),
-            str(product.get("gender", "")).lower(),
-        ]
-        for signal in signals:
-            if signal and signal in intent:
-                score += 1
-
-        if score >= 3:
-            return "Strong match", "Core style attributes align with Bob's current shopping intent.", 0.72
-        if score == 2:
-            return "Good match", "Several style signals line up and this is a practical option.", 0.61
-        if score == 1:
-            return "Possible match", "There is partial alignment, but review alternatives before checkout.", 0.5
-        return "Weak match", "This item may not fit the current style intent as well as other recommendations.", 0.39
+        assessment = self._heuristic_breakdown(session, product)
+        return (
+            str(assessment["verdict"]),
+            str(assessment["rationale"]),
+            float(assessment["confidence"]),
+        )
 
     def check_match(self, *, session_id: str, product_id: int) -> dict[str, Any]:
         session = self.db.get_session(session_id)
@@ -348,6 +884,7 @@ class OutfitAssistantService:
         product = self.db.get_product(product_id)
         if not product:
             raise KeyError("Product not found.")
+        heuristic_assessment = self._heuristic_breakdown(session, product)
 
         ai_powered = False
         if self.ai_enabled:
@@ -384,15 +921,23 @@ class OutfitAssistantService:
                 raw = (resp.output_text or "").strip()
                 parsed = json.loads(raw)
                 verdict = str(parsed.get("verdict", "Possible match"))
-                rationale = str(parsed.get("rationale", "The item has partial alignment with Bob's intent."))
+                llm_rationale = str(parsed.get("rationale", "The item has partial alignment with Bob's intent.")).strip()
                 confidence = parsed.get("confidence")
                 confidence = float(confidence) if confidence is not None else 0.5
                 ai_powered = True
+                rationale = (
+                    f"{llm_rationale} "
+                    f"Heuristic check: {heuristic_assessment['rationale']}"
+                ).strip()
             except Exception:
                 _LOGGER.warning("Falling back to heuristic match scoring due to OpenAI unavailability.")
-                verdict, rationale, confidence = self._heuristic_match(session, product)
+                verdict = str(heuristic_assessment["verdict"])
+                rationale = str(heuristic_assessment["rationale"])
+                confidence = float(heuristic_assessment["confidence"])
         else:
-            verdict, rationale, confidence = self._heuristic_match(session, product)
+            verdict = str(heuristic_assessment["verdict"])
+            rationale = str(heuristic_assessment["rationale"])
+            confidence = float(heuristic_assessment["confidence"])
 
         self.db.store_match_check(
             session_id=session_id,
@@ -409,6 +954,7 @@ class OutfitAssistantService:
             "rationale": rationale,
             "confidence": confidence,
             "ai_powered": ai_powered,
+            "judgement_details": heuristic_assessment,
         }
 
     def image_path_for_product(self, product_id: int) -> Path | None:

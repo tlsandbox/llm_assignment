@@ -17,11 +17,16 @@ if [[ ! -x "${UVICORN_BIN}" ]]; then
   exit 1
 fi
 
-REQUESTED_PORT="${PORT:-8000}"
+REQUESTED_PORT="${PORT:-8001}"
+
+port_is_busy() {
+  local port="$1"
+  lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+}
 
 find_free_port() {
   local port="$1"
-  while lsof -nP -iTCP@127.0.0.1:"${port}" -sTCP:LISTEN >/dev/null 2>&1; do
+  while port_is_busy "${port}"; do
     port=$((port + 1))
   done
   echo "${port}"
@@ -41,9 +46,9 @@ if [[ ${#stale_pids[@]} -gt 0 ]]; then
 fi
 
 PORT_TO_USE="${REQUESTED_PORT}"
-if lsof -nP -iTCP@127.0.0.1:"${PORT_TO_USE}" -sTCP:LISTEN >/dev/null 2>&1; then
+if port_is_busy "${PORT_TO_USE}"; then
   PORT_TO_USE="$(find_free_port $((REQUESTED_PORT + 1)))"
-  echo "Port 127.0.0.1:${REQUESTED_PORT} is busy; using ${PORT_TO_USE} instead."
+  echo "Port ${REQUESTED_PORT} is busy; using ${PORT_TO_USE} instead."
 fi
 
 echo "Starting RetailNext API on http://127.0.0.1:${PORT_TO_USE}"
