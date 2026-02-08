@@ -34,7 +34,7 @@ flowchart LR
     Service --> Index
 ```
 
-## What Bob Can Demo
+## How to Demo with Bob Shopping Experience
 
 1. **Natural-language-query-search**
 - Bob types a request in the top search bar.
